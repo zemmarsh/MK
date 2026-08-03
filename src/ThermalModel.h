@@ -41,19 +41,52 @@
  * Используем рекурсивный МНК (Recursive Least Squares, RLS) —
  * это позволяет обновлять оценку на каждом шаге без хранения
  * всей истории данных (экономия памяти на микроконтроллере).
+ *
+ * ВАЖНО — избегаем самоссылающейся обратной связи:
+ * Регрессия НЕ должна обучаться на полном PWM (pidOutput + ffOutput),
+ * потому что ffOutput сам вычисляется через текущую оценку Kloss —
+ * это создаёт замкнутый контур (Kloss влияет на PWM, PWM снова
+ * используется для оценки Kloss), из-за которого оценка "убегает"
+ * (дрейфует), не сходясь к физически верному значению.
+ *
+ * Правильный сигнал для обучения — это НЕЗАВИСИМАЯ от текущего
+ * Kloss величина: суммарный установившийся PWM, накопленный за
+ * время устойчивого удержания setpoint, то есть
+ * (baseline из прошлой оценки) + (устойчивая добавка от PID),
+ * усреднённая за окно времени, а не мгновенное значение на каждом
+ * такте. На практике проще всего подавать в регрессию
+ * pidOutput-компоненту, накопленную/усреднённую, ПЛЮС предыдущий
+ * feedforward, то есть "какой PWM реально потребовался", беря его
+ * не чаще, чем раз в несколько секунд устойчивого режима — это
+ * разрывает мгновенную обратную связь и даёт регрессии время
+ * "увидеть" последствия своего последнего обновления, прежде чем
+ * обновляться снова.
  */
 class ThermalModel {
 public:
-  ThermalModel(float initialSlope, float initialIntercept, float forgettingFactor = 0.98f)
+  ThermalModel(float initialSlope, float initialIntercept, float forgettingFactor = 0.995f,
+               unsigned long minUpdateIntervalMs = 5000)
     : b(initialSlope), a(initialIntercept),
       lambda(forgettingFactor),
-      P11(1000.0f), P22(1000.0f), P12(0.0f) {}
+      P11(1000.0f), P22(1000.0f), P12(0.0f),
+      minUpdateInterval(minUpdateIntervalMs), lastUpdateTime(0) {}
 
   // Обновление оценки коэффициентов регрессии по новой точке данных.
   // Вызывать только когда система близка к установившемуся режиму
   // (например, |dT/dt| мало), иначе оценка будет смещена переходным
   // процессом.
-  void updateRegression(float deltaT, float pwmObserved) {
+  //
+  // ЗАЩИТА ОТ ЗАМКНУТОЙ ОБРАТНОЙ СВЯЗИ: обновление применяется не
+  // чаще, чем раз в minUpdateInterval миллисекунд. Это даёт системе
+  // время "отработать" предыдущее изменение Kloss через PID, прежде
+  // чем регрессия увидит следующую точку — без этого регрессия учится
+  // на PWM, который сама же только что изменила, и оценка дрейфует,
+  // а не сходится.
+  bool updateRegression(float deltaT, float pwmObserved) {
+    unsigned long now = millis();
+    if (now - lastUpdateTime < minUpdateInterval) return false;
+    lastUpdateTime = now;
+
     // x = [1, deltaT] — вектор регрессоров для (a, b)
     // RLS с забыванием (forgetting factor lambda) — старые данные
     // постепенно теряют вес, модель адаптируется к дрейфу параметров
@@ -63,7 +96,7 @@ public:
     float Px1 = P11 * x1 + P12 * x2;
     float Px2 = P12 * x1 + P22 * x2;
     float denom = lambda + x1 * Px1 + x2 * Px2;
-    if (fabs(denom) < 1e-6f) return; // защита от деления на ноль
+    if (fabs(denom) < 1e-6f) return false; // защита от деления на ноль
 
     float K1 = Px1 / denom;
     float K2 = Px2 / denom;
@@ -82,6 +115,7 @@ public:
 
     // Физически коэффициент теплопотерь не может быть отрицательным
     b = max(b, 0.0f);
+    return true;
   }
 
   float getEstimatedKloss() const { return b; }
@@ -100,6 +134,9 @@ private:
 
   // Элементы 2x2 ковариационной матрицы RLS (симметричная, P12=P21)
   float P11, P22, P12;
+
+  unsigned long minUpdateInterval; // минимальный интервал между обновлениями, мс
+  unsigned long lastUpdateTime;
 };
 
 #endif
