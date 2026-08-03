@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "author": "Thermostat Project",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-arduino-uno", "id": "uno", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-ds18b20", "id": "ds_plate", "top": -80, "left": 150, "attrs": {} },
+    { "type": "wokwi-ds18b20", "id": "ds_outdoor", "top": -80, "left": 280, "attrs": {} },
+    { "type": "wokwi-resistor", "id": "r_plate", "top": -60, "left": 190, "attrs": { "value": "4700" } },
+    { "type": "wokwi-resistor", "id": "r_outdoor", "top": -60, "left": 320, "attrs": { "value": "4700" } },
+    { "type": "wokwi-led", "id": "led_actuator", "top": 100, "left": 150, "attrs": { "color": "red" } },
+    { "type": "wokwi-resistor", "id": "r_led", "top": 100, "left": 100, "attrs": { "value": "220" } }
+  ],
+  "connections": [
+    [ "ds_plate:VCC", "uno:5V", "red", [] ],
+    [ "ds_plate:GND", "uno:GND.1", "black", [] ],
+    [ "ds_plate:DQ", "uno:2", "green", [] ],
+    [ "r_plate:1", "ds_plate:VCC", "red", [] ],
+    [ "r_plate:2", "ds_plate:DQ", "green", [] ],
+
+    [ "ds_outdoor:VCC", "uno:5V", "red", [] ],
+    [ "ds_outdoor:GND", "uno:GND.2", "black", [] ],
+    [ "ds_outdoor:DQ", "uno:3", "blue", [] ],
+    [ "r_outdoor:1", "ds_outdoor:VCC", "red", [] ],
+    [ "r_outdoor:2", "ds_outdoor:DQ", "blue", [] ],
+
+    [ "uno:6", "r_led:1", "orange", [] ],
+    [ "r_led:2", "led_actuator:A", "orange", [] ],
+    [ "led_actuator:C", "uno:GND.3", "black", [] ]
+  ],
+  "dependencies": {}
+}

@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = '../src/build/thermostat_main.ino.hex'
+elf = '../src/build/thermostat_main.ino.elf'
