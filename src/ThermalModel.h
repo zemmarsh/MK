@@ -1,0 +1,105 @@
+#ifndef THERMAL_MODEL_H
+#define THERMAL_MODEL_H
+
+#include <Arduino.h>
+
+/*
+ * Класс ThermalModel — физико-математическая модель теплового
+ * баланса пластины.
+ *
+ * ФИЗИКА:
+ * Уравнение теплового баланса пластины (закон Ньютона-Рихмана
+ * для конвективных теплопотерь + подводимая мощность нагревателя):
+ *
+ *   C * dT/dt = P_heater - h*A*(T_plate - T_outdoor)
+ *
+ * где:
+ *   C        — теплоёмкость пластины [Дж/°C]
+ *   P_heater — мощность нагревателя, пропорциональна ШИМ (P = k_p * PWM)
+ *   h*A      — суммарный коэффициент теплопередачи в окружающую среду
+ *              (обозначим его K_loss, [Вт/°C])
+ *
+ * В установившемся режиме (dT/dt = 0):
+ *   P_heater = K_loss * (T_plate - T_outdoor)
+ *
+ * Именно отсюда взят feedforward-член в PID-регуляторе:
+ *   FF = Kff * (setpoint - T_outdoor),  где Kff ~ K_loss / k_p
+ *
+ * То есть Kff — не произвольный "магический" коэффициент, а
+ * физически обоснованная оценка теплопотерь на градус разницы
+ * температур, приведённая к единицам ШИМ.
+ *
+ * ОНЛАЙН-РЕГРЕССИЯ:
+ * Вместо того чтобы задавать Kff вручную константой, можно
+ * оценивать его в реальном времени по наблюдаемым данным —
+ * это простейшая линейная регрессия (метод наименьших квадратов,
+ * рекурсивная форма), которая ищет наилучшее K_loss, минимизируя
+ * ошибку предсказания установившегося PWM для наблюдаемой ΔT.
+ *
+ * Модель: PWM_steady ≈ a + b * (T_plate - T_outdoor)
+ * Нас интересует коэффициент b (аналог Kff).
+ * Используем рекурсивный МНК (Recursive Least Squares, RLS) —
+ * это позволяет обновлять оценку на каждом шаге без хранения
+ * всей истории данных (экономия памяти на микроконтроллере).
+ */
+class ThermalModel {
+public:
+  ThermalModel(float initialSlope, float initialIntercept, float forgettingFactor = 0.98f)
+    : b(initialSlope), a(initialIntercept),
+      lambda(forgettingFactor),
+      P11(1000.0f), P22(1000.0f), P12(0.0f) {}
+
+  // Обновление оценки коэффициентов регрессии по новой точке данных.
+  // Вызывать только когда система близка к установившемуся режиму
+  // (например, |dT/dt| мало), иначе оценка будет смещена переходным
+  // процессом.
+  void updateRegression(float deltaT, float pwmObserved) {
+    // x = [1, deltaT] — вектор регрессоров для (a, b)
+    // RLS с забыванием (forgetting factor lambda) — старые данные
+    // постепенно теряют вес, модель адаптируется к дрейфу параметров
+    // (например, если меняется изоляция или обдув).
+    float x1 = 1.0f, x2 = deltaT;
+
+    float Px1 = P11 * x1 + P12 * x2;
+    float Px2 = P12 * x1 + P22 * x2;
+    float denom = lambda + x1 * Px1 + x2 * Px2;
+    if (fabs(denom) < 1e-6f) return; // защита от деления на ноль
+
+    float K1 = Px1 / denom;
+    float K2 = Px2 / denom;
+
+    float predicted = a * x1 + b * x2;
+    float err = pwmObserved - predicted;
+
+    a += K1 * err;
+    b += K2 * err;
+
+    // Обновление ковариационной матрицы P
+    float newP11 = (P11 - K1 * Px1) / lambda;
+    float newP12 = (P12 - K1 * Px2) / lambda;
+    float newP22 = (P22 - K2 * Px2) / lambda;
+    P11 = newP11; P12 = newP12; P22 = newP22;
+
+    // Физически коэффициент теплопотерь не может быть отрицательным
+    b = max(b, 0.0f);
+  }
+
+  float getEstimatedKloss() const { return b; }
+  float getEstimatedBaseline() const { return a; }
+
+  // Теоретическое предсказание PWM в установившемся режиме —
+  // используется для сравнения "теория vs эксперимент"
+  float predictSteadyStatePWM(float deltaT) const {
+    return a + b * deltaT;
+  }
+
+private:
+  float b; // оценка K_loss (наклон) — аналог Kff
+  float a; // оценка базового смещения (intercept)
+  float lambda; // forgetting factor (0.9-0.999), меньше = быстрее адаптация
+
+  // Элементы 2x2 ковариационной матрицы RLS (симметричная, P12=P21)
+  float P11, P22, P12;
+};
+
+#endif
