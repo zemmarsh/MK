@@ -132,3 +132,8 @@ BOOT → HEATING ⇄ STABILIZED
 arduino-cli compile --fqbn arduino:avr:uno src/
 arduino-cli upload -p /dev/ttyUSB0 --fqbn arduino:avr:uno src/
 ```
+
+## как запустить код питона для графики:
+```bash
+python .\analyze_log.py telemetry.csv
+```
