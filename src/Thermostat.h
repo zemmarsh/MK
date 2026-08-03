@@ -2,233 +2,116 @@
 #define THERMOSTAT_H
 
 #include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include "Sensor.h"
 #include "PIDController.h"
 #include "ThermalModel.h"
 
-/*
- * Класс Thermostat — верхнеуровневая интеграция всех компонентов
- * системы. Реализует конечный автомат (state machine):
- *
- *   BOOT -> AUTOTUNE -> HEATING -> STABILIZED
- *                              \-> ERROR (если датчик отвалился)
- *
- * Состояния:
- *   BOOT       — инициализация, прогрев датчиков (первые чтения)
- *   AUTOTUNE   — опционально: релейная автонастройка Kp/Ki/Kd
- *   HEATING    — активный прогрев к setpoint (большая ошибка)
- *   STABILIZED — температура близка к setpoint (|error| < eps),
- *                система обновляет онлайн-регрессию Kloss
- *   ERROR      — датчик отключился / данные недостоверны,
- *                актуатор переводится в безопасное состояние (0)
- *
- * Такое разделение состояний даёт:
- *  - явную защиту от аварий (ERROR всегда глушит нагреватель),
- *  - возможность включать регрессию только в стабильном режиме
- *    (когда dT/dt ~ 0, что и нужно для корректной оценки Kloss),
- *  - понятную диагностику через Serial для отчёта/видео.
- */
+#define ONE_WIRE_BUS_PLATE 2   // Датчик пластины (DS18B20 #1)
+#define ONE_WIRE_BUS_OUTDOOR 3 // Датчик улицы (DS18B20 #2)
+#define PWM_PIN 6              // MOSFET / Нагреватель (D6 PWM)
+
+enum class State { BOOT, AUTOTUNE, HEATING, STABILIZED };
+
 class Thermostat {
-public:
-  enum State { BOOT, AUTOTUNE, HEATING, STABILIZED, ERROR_STATE };
-
-  Thermostat(uint8_t platePin, uint8_t outdoorPin, uint8_t actuatorPin,
-             float setpointC, float emaAlpha, bool enableAutotune = false)
-    : plateSensor(platePin, emaAlpha, 12),
-      outdoorSensor(outdoorPin, emaAlpha, 9), // улице точность не критична ->
-                                               // 9 бит = быстрее и экономичнее
-      pid(18.0f, 0.4f, 3.5f, 0.0f, 255.0f),
-      thermalModel(/*initial Kloss*/ 2.5f, /*intercept*/ 0.0f),
-      actuatorPin(actuatorPin),
-      setpoint(setpointC),
-      state(BOOT),
-      autotuneRequested(enableAutotune),
-      bootStartTime(0),
-      lastLoopTime(0),
-      currentPWM(0),
-      stabilizedErrorThreshold(0.5f),
-      rampMaxStepPerSecond(60.0f) // ограничение скорости нарастания ШИМ
-  {}
-
-  void begin() {
-    plateSensor.begin();
-    outdoorSensor.begin();
-    pinMode(actuatorPin, OUTPUT);
-    bootStartTime = millis();
-    lastLoopTime = millis();
-    plateSensor.requestReading();
-    outdoorSensor.requestReading();
-  }
-
-  // Вызывается в каждом проходе loop(); сам следит за интервалом.
-  // Возвращает true, если в этом вызове была выполнена полная итерация
-  // (обновление регулятора) — удобно для тайминга логирования.
-  bool update() {
-    unsigned long now = millis();
-    float dt = (now - lastLoopTime) / 1000.0f;
-    if (dt < 0.5f) return false; // опрос раз в 500мс, как в исходной версии
-    lastLoopTime = now;
-
-    // Неблокирующее обновление датчиков
-    bool plateReady = plateSensor.update();
-    bool outdoorReady = outdoorSensor.update();
-    plateSensor.requestReading();   // сразу запускаем следующую конверсию
-    outdoorSensor.requestReading();
-
-    float plateTemp = plateSensor.getFiltered();
-    float outdoorTemp = outdoorSensor.getFiltered();
-
-    // --- Переходы состояний ---
-    if (plateSensor.isFailed() || outdoorSensor.isFailed()) {
-      state = ERROR_STATE;
-    } else if (state == ERROR_STATE) {
-      // Датчики восстановились — возвращаемся к обычной работе
-      state = HEATING;
-      pid.reset();
-    } else if (state == BOOT && (now - bootStartTime > 2000)) {
-      // Даём 2 секунды на прогрев/первые чтения датчиков
-      state = autotuneRequested ? AUTOTUNE : HEATING;
-    }
-
-    float error = setpoint - plateTemp;
-    if (state == HEATING && fabs(error) < stabilizedErrorThreshold) {
-      state = STABILIZED;
-    } else if (state == STABILIZED && fabs(error) >= stabilizedErrorThreshold * 2.0f) {
-      state = HEATING; // существенное отклонение — снова активный прогрев
-    }
-
-    // --- Управляющее воздействие в зависимости от состояния ---
-    float targetPWM = 0.0f;
-
-    switch (state) {
-      case ERROR_STATE:
-        targetPWM = 0.0f; // безопасное состояние — нагреватель выключен
-        break;
-
-      case BOOT:
-        targetPWM = 0.0f;
-        break;
-
-      case AUTOTUNE: {
-        // Релейная автонастройка (упрощённый метод Ziegler-Nichols):
-        // PIDController сам переключает актуатор между 0 и заданной
-        // амплитудой, измеряет период/амплитуду автоколебаний и, набрав
-        // нужное число циклов, пересчитывает Kp/Ki/Kd и возвращает true.
-        const float relayAmplitude = 200.0f; // амплитуда релейного сигнала
-        const uint8_t minCycles = 4;         // сколько циклов колебаний набрать
-        float autotunePWM = 0.0f;
-        bool done = pid.autotuneStep(setpoint, plateTemp, dt,
-                                      relayAmplitude, minCycles, autotunePWM);
-        targetPWM = autotunePWM;
-
-        if (done) {
-          // Калибровка завершена — Kp/Ki/Kd уже обновлены внутри pid.
-          // Сбрасываем интегратор перед началом обычной работы и уходим
-          // в HEATING с новыми коэффициентами.
-          pid.reset();
-          state = HEATING;
-        }
-        break;
-      }
-
-      case HEATING:
-      case STABILIZED: {
-        float pidOut = pid.compute(setpoint, plateTemp, dt);
-
-        // Feedforward: физически обоснованная компенсация теплопотерь.
-        // Используем ОЦЕНКУ Kloss из онлайн-регрессии вместо статичной
-        // константы Kff — модель самонастраивается под реальные условия
-        // (см. ThermalModel.h).
-        float deltaT = setpoint - outdoorTemp;
-        float ffOutput = 0.0f;
-        if (deltaT > 0) {
-          ffOutput = thermalModel.getEstimatedKloss() * deltaT
-                     + thermalModel.getEstimatedBaseline();
-        }
-
-        targetPWM = pidOut + ffOutput;
-
-        // Обновляем регрессию ТОЛЬКО в стабильном режиме, когда
-        // dT/dt близко к нулю — иначе оценка Kloss будет искажена
-        // переходным процессом нагрева/остывания.
-        //
-        // ВАЖНО: подаём в регрессию НЕ targetPWM/currentPWM целиком,
-        // а "фактически потребовавшийся суммарный PWM" через связку
-        // (предыдущий ffOutput + pidOut) — то есть используем pidOut
-        // как независимую от ТЕКУЩЕЙ оценки Kloss меру рассогласования.
-        // Если PID продолжает добавлять положительную поправку поверх
-        // FF — значит FF занижен; если PID тянет вниз — FF завышен.
-        // Регрессия учится на (deltaT, ffOutput + pidOut), но
-        // ThermalModel сам ограничивает частоту обновлений (не чаще
-        // раза в несколько секунд), разрывая мгновенную обратную связь,
-        // из-за которой оценка раньше "убегала", не сходясь.
-        if (state == STABILIZED) {
-          thermalModel.updateRegression(deltaT, ffOutput + pidOut);
-        }
-        break;
-      }
-    }
-
-    targetPWM = constrain(targetPWM, 0.0f, 255.0f);
-
-    // Ограничение скорости нарастания ШИМ (rate limiting) — защищает
-    // нагревательный элемент от резких скачков тока и механических
-    // напряжений (полезно для реальных нагревателей/Пельтье).
-    float maxStep = rampMaxStepPerSecond * dt;
-    float delta = constrain(targetPWM - currentPWM, -maxStep, maxStep);
-    currentPWM += delta;
-
-    analogWrite(actuatorPin, (int)currentPWM);
-
-    lastDt = dt;
-    lastPlateTemp = plateTemp;
-    lastOutdoorTemp = outdoorTemp;
-    return true;
-  }
-
-  // --- Геттеры для логирования / Serial Plotter ---
-  float getPlateTemp() const { return lastPlateTemp; }
-  float getOutdoorTemp() const { return lastOutdoorTemp; }
-  float getPWM() const { return currentPWM; }
-  float getSetpoint() const { return setpoint; }
-  State getState() const { return state; }
-  float getEstimatedKloss() const { return thermalModel.getEstimatedKloss(); }
-  float getKp() const { return pid.getKp(); }
-  float getKi() const { return pid.getKi(); }
-  float getKd() const { return pid.getKd(); }
-
-  const char* getStateName() const {
-    switch (state) {
-      case BOOT: return "BOOT";
-      case AUTOTUNE: return "AUTOTUNE";
-      case HEATING: return "HEATING";
-      case STABILIZED: return "STABILIZED";
-      case ERROR_STATE: return "ERROR";
-    }
-    return "UNKNOWN";
-  }
-
-  void setSetpoint(float sp) { setpoint = sp; }
-
 private:
-  Sensor plateSensor;
-  Sensor outdoorSensor;
-  PIDController pid;
-  ThermalModel thermalModel;
+    State currentState = State::BOOT;
 
-  uint8_t actuatorPin;
-  float setpoint;
-  State state;
-  bool autotuneRequested;
+    OneWire oneWirePlate{ONE_WIRE_BUS_PLATE};
+    OneWire oneWireOutdoor{ONE_WIRE_BUS_OUTDOOR};
+    DallasTemperature sensorPlate{&oneWirePlate};
+    DallasTemperature sensorOutdoor{&oneWireOutdoor};
 
-  unsigned long bootStartTime;
-  unsigned long lastLoopTime;
+    Sensor plateSensor{750};   // 12 бит
+    Sensor outdoorSensor{100}; // 9 бит
 
-  float currentPWM;
-  float stabilizedErrorThreshold;
-  float rampMaxStepPerSecond;
+    PIDController pid;
+    ThermalModel model;
 
-  float lastDt = 0, lastPlateTemp = 0, lastOutdoorTemp = 0;
+    const float setpoint = 40.0f;
+    unsigned long stateTimer = 0;
+    unsigned long lastPrintTimer = 0;
+    float currentPWM = 0.0f;
+
+public:
+    void setup() {
+        pinMode(PWM_PIN, OUTPUT);
+        sensorPlate.begin();
+        sensorOutdoor.begin();
+        currentState = State::BOOT;
+    }
+
+    void update() {
+        sensorPlate.requestTemperatures();
+        sensorOutdoor.requestTemperatures();
+
+        float rawPlate = sensorPlate.getTempCByIndex(0);
+        float rawOutdoor = sensorOutdoor.getTempCByIndex(0);
+
+        if (rawPlate == DEVICE_DISCONNECTED_C || rawPlate < -50.0f) rawPlate = 20.0f;
+        if (rawOutdoor == DEVICE_DISCONNECTED_C || rawOutdoor < -50.0f) rawOutdoor = 20.0f;
+
+        plateSensor.update(rawPlate);
+        outdoorSensor.update(rawOutdoor);
+
+        float plateT = plateSensor.getValue();
+        float outdoorT = outdoorSensor.getValue();
+
+        switch (currentState) {
+            case State::BOOT:
+                stateTimer = millis();
+                currentState = State::AUTOTUNE;
+                break;
+
+            case State::AUTOTUNE:
+                analogWrite(PWM_PIN, 200);
+                currentPWM = 200.0f;
+
+                if (millis() - stateTimer > 15000) {
+                    pid.setTunings(4.5f, 0.08f, 1.2f);
+                    pid.resetIntegral();
+                    currentState = State::HEATING;
+                }
+                break;
+
+            case State::HEATING: {
+                float ff = model.getFeedforward(setpoint, outdoorT);
+                currentPWM = pid.compute(setpoint, plateT, ff);
+                analogWrite(PWM_PIN, (int)currentPWM);
+
+                if (abs(setpoint - plateT) < 0.5f) {
+                    currentState = State::STABILIZED;
+                }
+                break;
+            }
+
+            case State::STABILIZED: {
+                float ff = model.getFeedforward(setpoint, outdoorT);
+                currentPWM = pid.compute(setpoint, plateT, ff);
+                analogWrite(PWM_PIN, (int)currentPWM);
+
+                float deltaT = setpoint - outdoorT;
+                model.updateRLS(deltaT, currentPWM);
+
+                if (abs(setpoint - plateT) > 1.5f) {
+                    currentState = State::HEATING;
+                }
+                break;
+            }
+        }
+
+        // Вывод данных раз в 500 миллисекунд
+        if (millis() - lastPrintTimer >= 500) {
+            lastPrintTimer = millis();
+
+            Serial.print("Setpoint:"); Serial.print(setpoint); Serial.print(",");
+            Serial.print("PlateTemp:"); Serial.print(plateT); Serial.print(",");
+            Serial.print("OutdoorTemp:"); Serial.print(outdoorT); Serial.print(",");
+            Serial.print("PWM:"); Serial.print(currentPWM); Serial.print(",");
+            Serial.print("State:"); Serial.println((int)currentState);
+        }
+    }
 };
 
 #endif
