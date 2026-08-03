@@ -33,7 +33,7 @@ public:
   enum State { BOOT, AUTOTUNE, HEATING, STABILIZED, ERROR_STATE };
 
   Thermostat(uint8_t platePin, uint8_t outdoorPin, uint8_t actuatorPin,
-             float setpointC, float emaAlpha)
+             float setpointC, float emaAlpha, bool enableAutotune = false)
     : plateSensor(platePin, emaAlpha, 12),
       outdoorSensor(outdoorPin, emaAlpha, 9), // улице точность не критична ->
                                                // 9 бит = быстрее и экономичнее
@@ -42,6 +42,7 @@ public:
       actuatorPin(actuatorPin),
       setpoint(setpointC),
       state(BOOT),
+      autotuneRequested(enableAutotune),
       bootStartTime(0),
       lastLoopTime(0),
       currentPWM(0),
@@ -86,7 +87,7 @@ public:
       pid.reset();
     } else if (state == BOOT && (now - bootStartTime > 2000)) {
       // Даём 2 секунды на прогрев/первые чтения датчиков
-      state = HEATING;
+      state = autotuneRequested ? AUTOTUNE : HEATING;
     }
 
     float error = setpoint - plateTemp;
@@ -107,6 +108,28 @@ public:
       case BOOT:
         targetPWM = 0.0f;
         break;
+
+      case AUTOTUNE: {
+        // Релейная автонастройка (упрощённый метод Ziegler-Nichols):
+        // PIDController сам переключает актуатор между 0 и заданной
+        // амплитудой, измеряет период/амплитуду автоколебаний и, набрав
+        // нужное число циклов, пересчитывает Kp/Ki/Kd и возвращает true.
+        const float relayAmplitude = 200.0f; // амплитуда релейного сигнала
+        const uint8_t minCycles = 4;         // сколько циклов колебаний набрать
+        float autotunePWM = 0.0f;
+        bool done = pid.autotuneStep(setpoint, plateTemp, dt,
+                                      relayAmplitude, minCycles, autotunePWM);
+        targetPWM = autotunePWM;
+
+        if (done) {
+          // Калибровка завершена — Kp/Ki/Kd уже обновлены внутри pid.
+          // Сбрасываем интегратор перед началом обычной работы и уходим
+          // в HEATING с новыми коэффициентами.
+          pid.reset();
+          state = HEATING;
+        }
+        break;
+      }
 
       case HEATING:
       case STABILIZED: {
@@ -170,6 +193,9 @@ public:
   float getSetpoint() const { return setpoint; }
   State getState() const { return state; }
   float getEstimatedKloss() const { return thermalModel.getEstimatedKloss(); }
+  float getKp() const { return pid.getKp(); }
+  float getKi() const { return pid.getKi(); }
+  float getKd() const { return pid.getKd(); }
 
   const char* getStateName() const {
     switch (state) {
@@ -193,6 +219,7 @@ private:
   uint8_t actuatorPin;
   float setpoint;
   State state;
+  bool autotuneRequested;
 
   unsigned long bootStartTime;
   unsigned long lastLoopTime;

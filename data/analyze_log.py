@@ -21,7 +21,7 @@ def main(csv_path: str):
     df = pd.read_csv(csv_path)
     df["time_s"] = (df["time_ms"] - df["time_ms"].iloc[0]) / 1000.0
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 13), sharex=False)
 
     # --- График 1: температуры ---
     axes[0].plot(df["time_s"], df["plate_temp"], label="Пластина (факт)")
@@ -69,6 +69,31 @@ def main(csv_path: str):
         print(f"Оценка Kloss (финальная): {kloss_final:.3f}")
         print(f"Средняя абсолютная ошибка теория/эксперимент: {residuals.abs().mean():.2f} PWM-ед.")
         print(f"RMSE: {(residuals**2).mean()**0.5:.2f} PWM-ед.")
+
+    # --- Дополнительно: если в логе есть колонки Kp/Ki/Kd (после автонастройки) ---
+    if {"Kp", "Ki", "Kd"}.issubset(df.columns):
+        axes[3].plot(df["time_s"], df["Kp"], label="Kp")
+        axes[3].plot(df["time_s"], df["Ki"], label="Ki")
+        axes[3].plot(df["time_s"], df["Kd"], label="Kd")
+        axes[3].set_xlabel("Время, с")
+        axes[3].set_ylabel("Коэффициенты PID")
+        axes[3].legend()
+        axes[3].set_title("Коэффициенты PID (скачок = момент завершения автонастройки)")
+
+        # Отмечаем момент перехода AUTOTUNE -> HEATING на всех графиках
+        autotune_mask = df["state"] == "AUTOTUNE"
+        if autotune_mask.any():
+            autotune_end_time = df.loc[autotune_mask, "time_s"].max()
+            for ax in axes:
+                ax.axvline(autotune_end_time, color="gray", linestyle=":",
+                           label="Конец автонастройки" if ax is axes[0] else None)
+            axes[0].legend()
+            print(f"Автонастройка завершена на {autotune_end_time:.1f} с; "
+                  f"итоговые Kp={df['Kp'].iloc[-1]:.2f}, "
+                  f"Ki={df['Ki'].iloc[-1]:.2f}, Kd={df['Kd'].iloc[-1]:.2f}")
+
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150)
 
 
 if __name__ == "__main__":
