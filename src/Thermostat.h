@@ -104,12 +104,12 @@ public:
         // Вывод данных раз в 500 миллисекунд
         if (millis() - lastPrintTimer >= 500) {
             lastPrintTimer = millis();
-
-            Serial.print("Setpoint:"); Serial.print(setpoint); Serial.print(",");
-            Serial.print("PlateTemp:"); Serial.print(plateT); Serial.print(",");
-            Serial.print("OutdoorTemp:"); Serial.print(outdoorT); Serial.print(",");
-            Serial.print("PWM:"); Serial.print(currentPWM); Serial.print(",");
-            Serial.print("State:"); Serial.println((int)currentState);
+            Serial.print(millis()); Serial.print(",");
+            Serial.print(setpoint); Serial.print(",");
+            Serial.print(plateT); Serial.print(",");
+            Serial.print(outdoorT); Serial.print(",");
+            Serial.print(currentPWM); Serial.print(",");
+            Serial.println((int)currentState);
         }
     }
 };
